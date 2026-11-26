@@ -205,17 +205,17 @@ function buildSafeConnector(lookup: LookupFn) {
 
     socket.setNoDelay(true);
     socket
-      .once(isTls ? 'secureConnect' : 'connect', function onReady() {
+      .once(isTls ? 'secureConnect' : 'connect', () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         if (callback) {
           const cb = callback;
           callback = undefined as unknown as ConnectorCallback;
-          cb(null, this);
+          cb(null, socket);
         }
       })
-      .on('error', function onError(err) {
+      .on('error', (err: Error) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
