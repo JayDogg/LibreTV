@@ -2,7 +2,9 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { LookupAddress } from 'node:dns';
 import { lookup as callbackLookup } from 'node:dns';
 import dns from 'node:dns/promises';
-import { Agent, buildConnector, fetch as undiciFetch } from 'undici';
+import net from 'node:net';
+import tls from 'node:tls';
+import { Agent, fetch as undiciFetch } from 'undici';
 
 /** 去掉 URL.hostname 对 IPv6 附加的方括号（"[::1]" → "::1"） */
 function stripBrackets(host: string): string {
@@ -121,6 +123,113 @@ export interface SSRFProtectionContext {
 
 const ssrfStorage = new AsyncLocalStorage<SSRFProtectionContext>();
 
+type LookupFn = (
+  hostname: string,
+  options: { all?: boolean; family?: number; hints?: number },
+  callback: (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => void
+) => void;
+
+type ConnectorOptions = {
+  hostname: string;
+  host?: string;
+  protocol: string;
+  port?: number;
+  servername?: string;
+  localAddress?: string;
+  httpSocket?: unknown;
+};
+
+type ConnectorCallback = (err: NodeJS.ErrnoException | null, socket?: net.Socket | null) => void;
+
+/**
+ * 自建连接器（替代 undici 的 buildConnector）。
+ *
+ * 为什么不直接用 undici 的 buildConnector：
+ * undici@6 的 buildConnector 会在 tls.connect() 里**无条件**塞入
+ * `ALPNProtocols: ['http/1.1']`（即使 allowH2=false 也会传，且写死在 options 展开之后，
+ * 调用方无法覆盖）。而 Cloudflare Workers 的 node:tls 并未实现该选项，在兼容日期
+ * 2026-06-16 之后默认开启 `throw_on_not_implemented_tls_options` 兼容标志，
+ * 会直接抛出：
+ *
+ *   ERR_OPTION_NOT_IMPLEMENTED The options.ALPNProtocols option is not implemented
+ *
+ * 结果就是所有走 https 的出网请求全部失败（/api/proxy、/api/douban 等一律 502），
+ * 表现为"上游请求失败"。这里改为自行调用 tls.connect() / net.connect()，
+ * **不传 ALPNProtocols**，从而在 Workers 上正常出网；同时保留 undici 原本的行为
+ * （SNI、超时、keepAlive、setNoDelay 等）。
+ */
+function buildSafeConnector(lookup: LookupFn) {
+  const CONNECT_TIMEOUT = 10e3;
+
+  return function connect(opts: ConnectorOptions, callback: ConnectorCallback): net.Socket {
+    const { hostname, protocol, servername, localAddress } = opts;
+    const isTls = protocol === 'https:';
+    const port = opts.port || (isTls ? 443 : 80);
+
+    let socket: net.Socket;
+    if (isTls) {
+      socket = tls.connect({
+        highWaterMark: 16384,
+        servername: servername || hostname || undefined,
+        localAddress,
+        port,
+        host: hostname,
+      } as tls.ConnectionOptions);
+    } else {
+      socket = net.connect({
+        localAddress,
+        port,
+        host: hostname,
+      });
+      // undici 的 buildConnector 会给 net.connect 设 highWaterMark: 64 * 1024，这里保持一致
+      socket.setNoDelay(true);
+    }
+
+    socket.setKeepAlive(true, 60e3);
+
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      socket.destroy(
+        Object.assign(new Error(`Connect Timeout Error (address: ${hostname}:${port}, timeout: ${CONNECT_TIMEOUT}ms)`), {
+          code: 'UND_ERR_CONNECT_TIMEOUT',
+        })
+      );
+      if (callback) {
+        const cb = callback;
+        callback = undefined as unknown as ConnectorCallback;
+        cb(socket.errored || (new Error('Connect Timeout Error') as NodeJS.ErrnoException), null);
+      }
+    }, CONNECT_TIMEOUT);
+
+    socket.setNoDelay(true);
+    socket
+      .once(isTls ? 'secureConnect' : 'connect', function onReady() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (callback) {
+          const cb = callback;
+          callback = undefined as unknown as ConnectorCallback;
+          cb(null, this);
+        }
+      })
+      .on('error', function onError(err) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (callback) {
+          const cb = callback;
+          callback = undefined as unknown as ConnectorCallback;
+          cb(err as NodeJS.ErrnoException, null);
+        }
+      });
+
+    return socket;
+  };
+}
+
 /**
  * 创建受连接级 SSRF / DNS Rebinding 防护的专用 undici Agent。
  *
@@ -173,11 +282,11 @@ export function createSSRFAgent(options: { allowPrivate?: boolean } = {}): Agent
     });
   }
 
-  const baseConnector = buildConnector({
-    lookup: safeLookup as unknown as (hostname: string, options: import('node:dns').LookupOptions, callback: (err: NodeJS.ErrnoException | null, address: string | import('node:dns').LookupAddress[], family?: number) => void) => void,
-  });
+  const baseConnector = buildSafeConnector(
+    safeLookup as unknown as LookupFn
+  );
 
-  function ssrfConnect(opts: buildConnector.Options, cb: buildConnector.Callback) {
+  function ssrfConnect(opts: ConnectorOptions, cb: ConnectorCallback) {
     const cleanHost = stripBrackets(opts.hostname || '');
     if (!allowPrivate) {
       if (BLOCKED_HOSTNAMES.has(cleanHost.toLowerCase())) {
@@ -199,7 +308,7 @@ export function createSSRFAgent(options: { allowPrivate?: boolean } = {}): Agent
   }
 
   return new Agent({
-    connect: ssrfConnect,
+    connect: ssrfConnect as unknown as Agent.Options['connect'],
     pipelining: 0,
     keepAliveTimeout: 1,
     keepAliveMaxTimeout: 1,
@@ -223,6 +332,12 @@ const GLOBAL_FETCH_WRAPPED = Symbol.for('libretv.ssrf.fetch.wrapped');
  *   表现得像「网络挂了」。连不带自定义 connector 的裸 `new Agent()` 也一样失败，
  *   说明与我们的 safeLookup 无关，纯粹是跨副本不兼容。
  * 用同一份 undici 的 fetch 之后，运行时内置 undici 怎么换代都影响不到这里。
+ *
+ * Cloudflare Workers 场景补充：undici@6 的 buildConnector 会强制给 tls.connect()
+ * 传 ALPNProtocols，而 Workers 的 node:tls 未实现该选项，在兼容日期 2026-06-16
+ * 之后（throw_on_not_implemented_tls_options 默认开启）会抛
+ * ERR_OPTION_NOT_IMPLEMENTED，导致所有 https 出网失败。因此这里改用自建
+ * connector（不传 ALPNProtocols），其余防护逻辑保持不变。
  */
 export function installFetchSSRFProtection(): void {
   const g = globalThis as unknown as Record<symbol, boolean>;
