@@ -348,7 +348,7 @@ function safeHostFromUrl(urlString: string): string {
  * 私网/保留网段即拒绝（DNS Rebinding 防护，与 safeLookup 同一把尺子）。
  * 返回拒绝原因；未被拒绝返回空串。
  */
-async function isHostBlocked(host: string): Promise<string> {
+function isHostBlocked(host: string): string {
   const clean = stripBrackets(host);
   if (!clean) return '';
   if (BLOCKED_HOSTNAMES.has(clean.toLowerCase())) {
@@ -360,16 +360,11 @@ async function isHostBlocked(host: string): Promise<string> {
     }
     return '';
   }
-  try {
-    const addresses = await dns.lookup(clean, { all: true });
-    for (const item of addresses) {
-      if (isPrivateIP(item.address)) {
-        return `目标地址解析到私有/保留网络 (${item.address})`;
-      }
-    }
-  } catch {
-    // 解析失败不阻断，交由后续请求处理
-  }
+  // 域名不在这里做 DNS 解析：
+  // - Cloudflare Workers 的 node:dns 在请求路径上解析域名会耗尽 Worker 资源
+  //   限额（Error 1102 Worker exceeded resource limits）；
+  // - 域名级的 DNS Rebinding 校验已由 checkUpstreamAllowed / isBlockedByDNS
+  //   在每一跳重定向前完成（同样是 DNS 解析 + 私网判定），此处重复解析没有意义。
   return '';
 }
 
@@ -399,13 +394,14 @@ export function installFetchSSRFProtection(): void {
     //    建连前同步失败（issue #984）。
     // 运行时内置 fetch 是纯 JS 实现，无 WASM 依赖，也不受 undici 版本漂移影响。
     //
-    // 防护改由「请求前预检」承担：解析目标主机名，若命中私网/保留网段或黑名单，
-    // 立即抛 ERR_SSRF_BLOCKED；与连接层的 safeLookup 同一把尺子，DNS Rebinding
-    // 依旧无法绕过（预检与建连之间的时间窗内改 DNS，连接层同样会再查一次）。
+    // 防护改由「请求前预检」承担：命中私网/保留网段或黑名单立即抛 ERR_SSRF_BLOCKED。
+    // 这里只做**字面量**判断（不解析域名）：Workers 的 node:dns 在请求路径上解析域名
+    // 会触发 Error 1102（Worker exceeded resource limits）；域名级校验已由
+    // checkUpstreamAllowed / isBlockedByDNS 在每一跳重定向前完成。
     const target = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     const host = safeHostFromUrl(target);
     if (!ctx.allowPrivate && host) {
-      const blocked = await isHostBlocked(host);
+      const blocked = isHostBlocked(host);
       if (blocked) {
         throw Object.assign(new Error(`目标地址被拒绝: ${blocked}`), { code: 'ERR_SSRF_BLOCKED' });
       }
